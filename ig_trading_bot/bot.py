@@ -1,12 +1,12 @@
 """
-IG Markets CFD Trading Bot
-Strategy: Aggressive ASX 200 momentum swing trading
+IG Markets CFD Trading Bot - v2
+Strategy: Aggressive momentum swing trading
+Auto-discovers working markets and resolutions
 Author: Built for Simon via Claude
 """
 
 import time
 import logging
-import os
 from datetime import datetime, timezone
 from trading_ig import IGService
 from trading_ig.config import config
@@ -26,29 +26,79 @@ log = logging.getLogger(__name__)
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-# Markets to trade (IG EPIC codes)
-MARKETS = {
-   MARKETS = {
-    "GOLD":     "CS.D.CFDGOLD.CFM.IP",
-    "EURUSD":   "CS.D.EURUSD.MINI.IP",
-    "GBPUSD":   "CS.D.GBPUSD.MINI.IP",
+# Candidate markets to try (in priority order)
+# The bot will test each one and only trade the ones that work
+CANDIDATE_MARKETS = {
+    "ASX200":    "IX.D.ASX.CFD.IP",
+    "GOLD":      "CS.D.CFDGOLD.CFM.IP",
+    "OIL":       "CS.D.CFDSB.CFM.IP",
+    "ASX200_b":  "IX.D.ASX.IFM.IP",
+    "OIL_b":     "CS.D.CRUDE.CFM.IP",
+    "SILVER":    "CS.D.CFDSILVER.CFM.IP",
+    "COPPER":    "CS.D.COPPER.CFM.IP",
 }
-}
+
+# Resolutions to try (in order of preference)
+RESOLUTIONS_TO_TRY = ["1h", "H", "HOUR", "DAY", "D", "4h", "30Min", "15Min"]
 
 # Trading parameters
-ACCOUNT_SIZE       = 10_000   # AUD - your demo account size
-MAX_RISK_PER_TRADE = 0.10     # Risk max 10% of account per trade
-STOP_LOSS_PCT      = 0.015    # 1.5% stop loss from entry
-TAKE_PROFIT_PCT    = 0.050    # 5.0% take profit (3.3:1 R:R)
-SCAN_INTERVAL_SEC  = 60       # Check markets every 60 seconds
-MAX_OPEN_POSITIONS = 3        # Never hold more than 3 positions at once
+ACCOUNT_SIZE       = 10_000
+MAX_RISK_PER_TRADE = 0.10
+STOP_LOSS_PCT      = 0.015
+TAKE_PROFIT_PCT    = 0.050
+SCAN_INTERVAL_SEC  = 60
+MAX_OPEN_POSITIONS = 3
+MIN_CANDLES        = 30   # Minimum candles needed for indicators
 
-# Strategy: EMA Crossover + RSI Filter
-EMA_FAST    = 9    # Fast EMA period
-EMA_SLOW    = 21   # Slow EMA period
-RSI_PERIOD  = 14   # RSI period
+# Strategy parameters
+EMA_FAST       = 9
+EMA_SLOW       = 21
+RSI_PERIOD     = 14
 RSI_OVERBOUGHT = 70
 RSI_OVERSOLD   = 30
+
+
+# ─── Market Discovery ─────────────────────────────────────────────────────────
+
+def discover_working_markets(ig: IGService) -> dict:
+    """
+    Tests each candidate market with each resolution.
+    Returns a dict of {name: (epic, resolution)} for markets that work.
+    """
+    log.info("🔍 Discovering available markets and resolutions...")
+    working = {}
+
+    for name, epic in CANDIDATE_MARKETS.items():
+        # Skip alternate epics if we already found a working one for this market
+        base_name = name.replace("_b", "")
+        if base_name in working:
+            continue
+
+        for resolution in RESOLUTIONS_TO_TRY:
+            try:
+                log.info(f"  Testing {name} ({epic}) @ {resolution}...")
+                response = ig.fetch_historical_prices_by_epic_and_num_points(
+                    epic, resolution, 5
+                )
+                prices = response["prices"]
+                df = pd.DataFrame({
+                    "close": prices["bid"]["Close"]
+                }).dropna()
+
+                if len(df) >= 3:
+                    log.info(f"  ✅ {base_name} works! Epic={epic}, Resolution={resolution}")
+                    working[base_name] = (epic, resolution)
+                    break
+                else:
+                    log.info(f"  ⚠️  {name} @ {resolution}: too few data points")
+
+            except Exception as e:
+                log.info(f"  ❌ {name} @ {resolution}: {str(e)[:60]}")
+
+            time.sleep(1)  # Be gentle with the API
+
+    log.info(f"\n✅ Found {len(working)} working market(s): {list(working.keys())}")
+    return working
 
 
 # ─── Indicator Calculations ───────────────────────────────────────────────────
@@ -66,12 +116,6 @@ def calculate_rsi(prices: pd.Series, period: int = 14) -> pd.Series:
 
 
 def get_signal(df: pd.DataFrame) -> str:
-    """
-    Returns 'BUY', 'SELL', or 'HOLD' based on:
-    - EMA crossover (fast crosses above/below slow)
-    - RSI filter (avoid overbought buys / oversold sells)
-    - Price momentum confirmation
-    """
     if len(df) < EMA_SLOW + 5:
         return "HOLD"
 
@@ -80,32 +124,23 @@ def get_signal(df: pd.DataFrame) -> str:
     ema_slow = calculate_ema(close, EMA_SLOW)
     rsi = calculate_rsi(close, RSI_PERIOD)
 
-    # Current and previous values
     ef_now, ef_prev = ema_fast.iloc[-1], ema_fast.iloc[-2]
     es_now, es_prev = ema_slow.iloc[-1], ema_slow.iloc[-2]
     rsi_now = rsi.iloc[-1]
 
-    # Bullish crossover: fast crosses above slow, RSI not overbought
     bullish_cross = (ef_prev < es_prev) and (ef_now > es_now)
-    # Bearish crossover: fast crosses below slow, RSI not oversold
     bearish_cross = (ef_prev > es_prev) and (ef_now < es_now)
 
     if bullish_cross and rsi_now < RSI_OVERBOUGHT:
         return "BUY"
     elif bearish_cross and rsi_now > RSI_OVERSOLD:
         return "SELL"
-    else:
-        return "HOLD"
+    return "HOLD"
 
 
 # ─── Position Sizing ──────────────────────────────────────────────────────────
 
 def calculate_position_size(account_balance: float, current_price: float) -> float:
-    """
-    Risk-based position sizing.
-    Risks MAX_RISK_PER_TRADE of account, with stop at STOP_LOSS_PCT from entry.
-    Returns number of CFD contracts (minimum 1).
-    """
     risk_amount = account_balance * MAX_RISK_PER_TRADE
     stop_loss_points = current_price * STOP_LOSS_PCT
     size = risk_amount / stop_loss_points
@@ -114,8 +149,7 @@ def calculate_position_size(account_balance: float, current_price: float) -> flo
 
 # ─── IG API Helpers ───────────────────────────────────────────────────────────
 
-def fetch_prices(ig: IGService, epic: str, resolution: str = "MINUTE", num_points: int = 100) -> pd.DataFrame:
-    """Fetch historical OHLC prices for an epic."""
+def fetch_prices(ig: IGService, epic: str, resolution: str, num_points: int = 100) -> pd.DataFrame:
     try:
         response = ig.fetch_historical_prices_by_epic_and_num_points(epic, resolution, num_points)
         prices = response["prices"]
@@ -132,7 +166,6 @@ def fetch_prices(ig: IGService, epic: str, resolution: str = "MINUTE", num_point
 
 
 def get_open_positions(ig: IGService) -> list:
-    """Returns list of currently open positions."""
     try:
         positions = ig.fetch_open_positions()
         if isinstance(positions, pd.DataFrame):
@@ -144,7 +177,6 @@ def get_open_positions(ig: IGService) -> list:
 
 
 def open_position(ig: IGService, epic: str, direction: str, size: float, price: float):
-    """Open a CFD position with stop loss and take profit."""
     if direction == "BUY":
         stop_level  = round(price * (1 - STOP_LOSS_PCT), 2)
         limit_level = round(price * (1 + TAKE_PROFIT_PCT), 2)
@@ -178,23 +210,16 @@ def open_position(ig: IGService, epic: str, direction: str, size: float, price: 
         return None
 
 
-def close_all_losing_positions(ig: IGService):
-    """Emergency: close any position past max loss threshold."""
-    # IG auto-handles stop losses, but this is a safety net
-    pass
-
-
 # ─── Main Bot Loop ────────────────────────────────────────────────────────────
 
 def run_bot():
     log.info("=" * 60)
-    log.info("🤖 IG CFD Trading Bot Starting")
+    log.info("🤖 IG CFD Trading Bot v2 Starting")
     log.info(f"   Account Size:    AUD ${ACCOUNT_SIZE:,.0f}")
     log.info(f"   Max Risk/Trade:  {MAX_RISK_PER_TRADE*100:.0f}%")
     log.info(f"   Stop Loss:       {STOP_LOSS_PCT*100:.1f}%")
     log.info(f"   Take Profit:     {TAKE_PROFIT_PCT*100:.1f}%")
     log.info(f"   Scan Interval:   {SCAN_INTERVAL_SEC}s")
-    log.info(f"   Markets:         {', '.join(MARKETS.keys())}")
     log.info("=" * 60)
 
     # Connect to IG
@@ -207,25 +232,41 @@ def run_bot():
     ig.create_session()
     log.info("✅ Connected to IG Markets (DEMO)")
 
+    # Auto-discover working markets
+    working_markets = discover_working_markets(ig)
+
+    if not working_markets:
+        log.critical("❌ No working markets found. Check your IG API access and try again.")
+        return
+
+    log.info(f"\n🎯 Trading the following markets: {list(working_markets.keys())}")
+
+    # Rediscover markets every 6 hours in case something changes
+    last_discovery = time.time()
+    REDISCOVER_INTERVAL = 6 * 60 * 60
+
     scan_count = 0
 
     while True:
+        # Periodically re-check available markets
+        if time.time() - last_discovery > REDISCOVER_INTERVAL:
+            log.info("🔄 Re-checking available markets...")
+            working_markets = discover_working_markets(ig)
+            last_discovery = time.time()
+
         scan_count += 1
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         log.info(f"\n--- Scan #{scan_count} | {now} ---")
 
-        # Get current open positions
         open_positions = get_open_positions(ig)
         log.info(f"Open positions: {len(open_positions)}/{MAX_OPEN_POSITIONS}")
 
         if len(open_positions) >= MAX_OPEN_POSITIONS:
             log.info("Max positions reached. Monitoring only.")
         else:
-            # Scan each market for signals
-            for name, epic in MARKETS.items():
-                log.info(f"Scanning {name} ({epic})...")
+            for name, (epic, resolution) in working_markets.items():
+                log.info(f"Scanning {name} ({epic}) @ {resolution}...")
 
-                # Check if already in this market
                 already_in = any(
                     p.get("market", {}).get("epic") == epic
                     for p in open_positions
@@ -234,28 +275,24 @@ def run_bot():
                     log.info(f"  Already holding {name}. Skipping.")
                     continue
 
-                # Fetch prices and generate signal
-                df = fetch_prices(ig, epic, resolution="1h", num_points=100)
+                df = fetch_prices(ig, epic, resolution, num_points=100)
                 if df.empty:
                     log.warning(f"  No price data for {name}. Skipping.")
                     continue
 
                 signal = get_signal(df)
                 current_price = df["close"].iloc[-1]
-
                 log.info(f"  {name}: Price={current_price:.2f} | Signal={signal}")
 
                 if signal in ("BUY", "SELL"):
-                    # Check we won't exceed max positions
                     if len(open_positions) < MAX_OPEN_POSITIONS:
                         size = calculate_position_size(ACCOUNT_SIZE, current_price)
                         log.info(f"  🎯 Signal! {signal} {name} | Size: {size} contracts")
                         open_position(ig, epic, signal, size, current_price)
-                        open_positions = get_open_positions(ig)  # Refresh
+                        open_positions = get_open_positions(ig)
                     else:
                         log.info(f"  Signal found for {name} but max positions reached.")
 
-                # Small delay between market scans to avoid API rate limits
                 time.sleep(2)
 
         log.info(f"Next scan in {SCAN_INTERVAL_SEC} seconds...\n")
