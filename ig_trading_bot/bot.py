@@ -233,7 +233,7 @@ def run_bot():
                     continue
 
                 # Fetch prices and generate signal
-                df = fetch_prices(ig, epic, resolution="MINUTE_5", num_points=100)
+                df = fetch_prices(ig, epic, resolution="5Min", num_points=100)
                 if df.empty:
                     log.warning(f"  No price data for {name}. Skipping.")
                     continue
