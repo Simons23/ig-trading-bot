@@ -28,9 +28,11 @@ log = logging.getLogger(__name__)
 
 # Markets to trade (IG EPIC codes)
 MARKETS = {
-    "ASX200":   "IX.D.ASX.CFD.IP",   # ASX 200 Index CFD
-    "GOLD":     "CS.D.CFDGOLD.CFM.IP", # Gold CFD
-    "OIL":      "CS.D.CFDSB.CFM.IP",   # Brent Crude Oil CFD
+   MARKETS = {
+    "GOLD":     "CS.D.CFDGOLD.CFM.IP",
+    "EURUSD":   "CS.D.EURUSD.MINI.IP",
+    "GBPUSD":   "CS.D.GBPUSD.MINI.IP",
+}
 }
 
 # Trading parameters
